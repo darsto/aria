@@ -2,7 +2,7 @@
 // Copyright(c) 2023 Darek Stojaczyk
 
 //! ARIA cipher in Rust. This is an amateur implementation. Use at your risk.
-//! Operates only on 32-bit values, so the input data must be 4-byte aligned.
+//! Performs operations on 32-bit rows instead of singular bytes.
 //! Based on ARIA specification 1.0, available at KISA webpage:
 //! https://seed.kisa.or.kr/kisa/Board/19/detailView.do
 
@@ -181,9 +181,6 @@ fn btshuffle(row: u32) -> u32 {
 fn btrev(row: u32) -> u32 {
     row.swap_bytes()
 }
-fn btrow(bytes: [u8; 4]) -> u32 {
-    u32::from_ne_bytes(bytes)
-}
 
 fn adv3(val: u32) -> u32 {
     (val + 1) % 3
@@ -310,7 +307,7 @@ pub fn derive_decrypt_key(expanded_key: &mut [u32]) {
     }
 }
 
-pub fn crypt_block(data: &[u32; 4], key: &[u32]) -> [u32; 4] {
+pub fn crypt_block(data: &[u8; 16], key: &[u32]) -> [u8; 16] {
     let num_rounds = match key.len() {
         0x44 => 16,
         0x3c => 14,
@@ -319,10 +316,10 @@ pub fn crypt_block(data: &[u32; 4], key: &[u32]) -> [u32; 4] {
     };
 
     let mut state: [u32; 4] = [
-        btrev(data[0]),
-        btrev(data[1]),
-        btrev(data[2]),
-        btrev(data[3]),
+        btrev(u32::from_le_bytes(data[0..4].try_into().unwrap())),
+        btrev(u32::from_le_bytes(data[4..8].try_into().unwrap())),
+        btrev(u32::from_le_bytes(data[8..12].try_into().unwrap())),
+        btrev(u32::from_le_bytes(data[12..16].try_into().unwrap())),
     ];
 
     let mut roundkeys = key.chunks_exact(4);
@@ -370,19 +367,17 @@ pub fn crypt_block(data: &[u32; 4], key: &[u32]) -> [u32; 4] {
     let roundkey1 = unsafe { roundkeys.next().unwrap_unchecked() };
     let roundkey2 = unsafe { roundkeys.next().unwrap_unchecked() };
 
-    let mut ret = [0u32; 4];
+    let mut ret = [0u8; 16];
     for i in 0..4 {
-        let keyed = btshift2(state[i] ^ roundkey1[i]);
-        let sub = btrow(unsafe {
-            [
-                *IBOX1.get_unchecked(byte1(keyed) as usize) as u8,
-                (*IBOX2.get_unchecked(byte0(keyed) as usize) >> 8) as u8,
-                *SBOX1.get_unchecked(byte3(keyed) as usize) as u8,
-                *SBOX2.get_unchecked(byte2(keyed) as usize) as u8,
-            ]
-        });
+        let keyed = state[i] ^ roundkey1[i];
+        let roundkey2 = roundkey2[i].to_le_bytes();
 
-        ret[i] = sub ^ btrev(roundkey2[i]);
+        unsafe {
+            ret[i * 4] = roundkey2[3] ^ *IBOX1.get_unchecked(byte3(keyed) as usize) as u8;
+            ret[i * 4 + 1] = roundkey2[2] ^ (*IBOX2.get_unchecked(byte2(keyed) as usize) >> 8) as u8;
+            ret[i * 4 + 2] = roundkey2[1] ^ *SBOX1.get_unchecked(byte1(keyed) as usize) as u8;
+            ret[i * 4 + 3] = roundkey2[0] ^ *SBOX2.get_unchecked(byte0(keyed) as usize) as u8;
+        }
     }
 
     ret

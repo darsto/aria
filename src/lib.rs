@@ -6,80 +6,52 @@
 
 mod imp;
 
-use bincode::de::BorrowDecoder;
-use bincode::de::read::Reader;
-use bincode::error::{DecodeError, EncodeError};
-use bincode::{Decode, Encode, BorrowDecode};
-use byte_slice_cast::{AsByteSlice, AsSliceOf};
 use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 use std::ptr::addr_of_mut;
 
+/// A 16-byte Block of data to be ciphered
+/// It's 16-byte aligned for potentially easier memcpy (8-byte boundary),
+/// and typical cache line alignment (64), but no benchmarks were done.
 #[repr(C, align(16))]
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Block([u8; 16]);
 
 impl Block {
+    /// Creates a zero-initialized Block
     pub fn new() -> Self {
         Block::default()
     }
 
-    pub fn from_bytes<T: AsRef<[u8]>>(bytes: T) -> Block {
-        // Need to copy the original bytes to ensure proper alignment
-        let mut block: MaybeUninit<Block> = MaybeUninit::uninit();
-        unsafe {
-            let block_ptr = block.as_mut_ptr() as *mut u8;
-            let src_len: usize = std::cmp::min(bytes.as_ref().len(), 16);
-            block_ptr.copy_from_nonoverlapping(bytes.as_ref().as_ptr(), src_len);
-            block_ptr.add(src_len).write_bytes(0, 16 - src_len);
-        }
-        unsafe { block.assume_init() }
+    /// Get a byte slice to the internal data buffer
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
 
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(str: &str) -> Block {
-        Self::from_bytes(str.as_bytes())
+    /// Get a mutable byte slice to the internal data buffer
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.0
     }
 
-    pub fn arr_from_str<const N: usize>(str: &str) -> [Block; N] {
-        Self::arr_from_bytes(str.as_bytes())
+    pub fn try_as_str(&self) -> Result<&str, std::str::Utf8Error> {
+        let bytes = self.as_bytes();
+        // find a smaller zero-terminated slice
+        let real_len = bytes.iter().position(|&e| e == 0).unwrap_or(bytes.len());
+        std::str::from_utf8(&bytes[0..real_len])
     }
 
-    pub fn arr_from_bytes<T: AsRef<[u8]>, const N: usize>(bytes: T) -> [Block; N] {
+    /// Creates an array of Block-s from the provided byte slice. Up to N*16 bytes
+    /// will be memcpied from the provided slice. If the slice is even smaller, the
+    /// remaining Block-s are filled with zeroes
+    pub fn arr_from_slice<T: AsRef<[u8]>, const N: usize>(bytes: T) -> [Block; N] {
         core::array::from_fn(|i| {
             let slice = if i * 16 < bytes.as_ref().len() {
                 &bytes.as_ref()[i * 16..]
             } else {
                 &[]
             };
-            Self::from_bytes(slice)
+            Self::from(slice)
         })
-    }
-
-    pub fn as_rows(&self) -> &[u32; 4] {
-        let data: &[u32] = self.0.as_slice_of().unwrap();
-        let data: &[u32; 4] = data.try_into().unwrap();
-        data
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 16] {
-        self
-    }
-
-    pub fn try_as_utf8_string(blocks: &[Block]) -> Result<&str, std::str::Utf8Error> {
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(blocks.as_ptr() as *const u8, blocks.len() * 16)
-        };
-        // find a smaller zero-terminated slice
-        let bytes: &[u8] = match bytes.iter().position(|&e| e == 0) {
-            Some(len) => {
-                unsafe {
-                    std::slice::from_raw_parts(blocks.as_ptr() as *const u8, len)
-                }
-            },
-            None => bytes,
-        };
-        std::str::from_utf8(bytes)
     }
 }
 
@@ -97,31 +69,76 @@ impl DerefMut for Block {
     }
 }
 
-impl Encode for Block {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> std::result::Result<(), EncodeError> {
-        self.0.encode(encoder)
+/// Creates a Block from the provided byte slice. This performs a memcpy.
+/// Only up to 16 bytes from the slice are copied. If the slice is even
+/// smaller, the rest of the Block is filled with zeroes
+impl<T: AsRef<[u8]>> From<T> for Block {
+    fn from(value: T) -> Self {
+        // Need to copy the original bytes to ensure proper alignment
+        let mut block: MaybeUninit<Self> = MaybeUninit::uninit();
+        let block_ptr = block.as_mut_ptr() as *mut u8;
+        let src_len: usize = std::cmp::min(value.as_ref().len(), 16);
+        // SAFETY: We're writing the whole Block, just avoiding the unnecesary
+        // zero-initialization in the beginning.
+        unsafe {
+            block_ptr.copy_from_nonoverlapping(value.as_ref().as_ptr(), src_len);
+            block_ptr.add(src_len).write_bytes(0, 16 - src_len);
+            block.assume_init()
+        }
     }
 }
 
-impl Decode for Block {
-    fn decode<D: bincode::de::Decoder>(decoder: &mut D) -> std::result::Result<Self, DecodeError> {
-        let mut bytes = [0u8; 16];
-        decoder.reader().read(&mut bytes)?;
-        Ok(Block(bytes))
+fn slice_u32_to_u8(input: &[u32]) -> &[u8] {
+    // SAFETY: We're casting [u32] to exact-length [u8], which is always safe
+    unsafe {
+        std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4)
     }
 }
 
-impl<'a> BorrowDecode<'a> for Block {
-    fn borrow_decode<D: BorrowDecoder<'a>>(_decoder: &mut D) -> Result<Self, DecodeError> {
-        unimplemented!();
+fn slice_u32_to_u8_mut(input: &mut [u32]) -> &mut [u8] {
+    // SAFETY: We're casting [u32] to exact-length [u8], which is always safe
+    unsafe {
+        std::slice::from_raw_parts_mut(input.as_ptr() as *mut u8, input.len() * 4)
     }
 }
 
+pub trait BlockSlice {
+    fn try_as_str(&self) -> Result<&str, std::str::Utf8Error>;
+    fn as_bytes(&self) -> &[u8];
+    fn as_bytes_mut(&mut self) -> &mut [u8];
+}
+
+impl BlockSlice for [Block] {
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: The Block is just a wrapper over 16 bytes and has no padding.
+        // A slice of Block is always just a contiguous piece of memory, so it's
+        // always safe to cast it to &[u8]
+        unsafe {
+            std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 16)
+        }
+    }
+
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: The Block is just a wrapper over 16 bytes and has no padding.
+        // A slice of Block is always just a contiguous piece of memory, so it's
+        // always safe to cast it to &[u8]
+        unsafe {
+            std::slice::from_raw_parts_mut(self.as_ptr() as *mut u8, self.len() * 16)
+        }
+    }
+
+    fn try_as_str(&self) -> Result<&str, std::str::Utf8Error> {
+        let bytes = self.as_bytes();
+        // find a smaller zero-terminated slice
+        let real_len = bytes.iter().position(|&e| e == 0).unwrap_or(bytes.len());
+        std::str::from_utf8(&bytes[0..real_len])
+    }
+}
+
+/// Source key for the cipher. This can be later expanded into an [`ExpandedKey`]
+/// used for encryption, which can be later derived into a [`DecryptKey`]
 #[repr(C, align(8))]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Key {
     /// 256-bit key, with trailing zeroes if needed
     data: [u32; 8],
@@ -129,10 +146,88 @@ pub struct Key {
     len: KeyLen,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum KeyLen {
+impl Key {
+    /// Convert a Key into an [`ExpandedKey`] used for actual encryption
+    pub fn expand(&self) -> ExpandedKey {
+        let mut expkey = match &self.len {
+            KeyLen::K256 => ExpandedKey::K256([0u32; 0x44]),
+            KeyLen::K192 => ExpandedKey::K192([0u32; 0x3c]),
+            KeyLen::K128 => ExpandedKey::K128([0u32; 0x34]),
+        };
+
+        imp::expand_key(expkey.as_mut_slice(), &self.data);
+        expkey
+    }
+
+    /// Get a byte slice to the internal key byte slice
+    pub fn as_bytes(&self) -> &[u8] {
+        slice_u32_to_u8(&self.data)
+    }
+
+    /// Get a mutable byte slice to the internal key byte slice
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        slice_u32_to_u8_mut(&mut self.data)
+    }
+}
+
+/// Try to create a Key from the given slice. This succeeds for slice length
+/// 16, 24, and 32. For all other lengths this return Err. For non-fallible
+/// variants of this, there is `From<[u8; 32]>`, `From<[u8; 24]>`, and
+/// `From<[u8; 24]>`.
+impl TryFrom<&[u8]> for Key {
+    type Error = ();
+    fn try_from(src: &[u8]) -> Result<Self, Self::Error> {
+        if let Ok(keylen) = KeyLen::try_from(src.len()) {
+            let mut key: MaybeUninit<Key> = MaybeUninit::uninit();
+            let keyptr = key.as_mut_ptr();
+
+            // SAFETY: We're always writing the full Key, just avoiding the unnecesary
+            // zero-initialization in the beginning.
+            unsafe {
+                let data_ptr = addr_of_mut!((*keyptr).data) as *mut u8;
+                let src_len = usize::from(keylen);
+                data_ptr.copy_from_nonoverlapping(src.as_ptr(), src_len);
+                data_ptr.add(src_len).write_bytes(0, 32 - src_len);
+                addr_of_mut!((*keyptr).len).write(keylen);
+                Ok(key.assume_init())
+            }
+        } else {
+            Err(())
+        }
+    }
+}
+
+impl From<[u8; 32]> for Key {
+    fn from(data: [u8; 32]) -> Self {
+        // SAFETY: We're always constructing a 32-byte-long key, which always succeeds
+        unsafe {
+            Self::try_from(data.as_slice()).unwrap_unchecked()
+        }
+    }
+}
+
+impl From<[u8; 24]> for Key {
+    fn from(data: [u8; 24]) -> Self {
+        // SAFETY: We're always constructing a 24-byte-long key, which always succeeds
+        unsafe {
+            Self::try_from(data.as_slice()).unwrap_unchecked()
+        }
+    }
+}
+
+impl From<[u8; 16]> for Key {
+    fn from(data: [u8; 16]) -> Self {
+        // SAFETY: We're always constructing a 16-byte-long key, which always succeeds
+        unsafe {
+            Self::try_from(data.as_slice()).unwrap_unchecked()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyLen {
     K256,
-    K196,
+    K192,
     K128,
 }
 
@@ -142,7 +237,7 @@ impl TryFrom<usize> for KeyLen {
     fn try_from(value: usize) -> Result<Self, Self::Error> {
         Ok(match value {
             32 => Self::K256,
-            24 => Self::K196,
+            24 => Self::K192,
             16 => Self::K128,
             _ => {
                 return Err(());
@@ -155,55 +250,16 @@ impl From<KeyLen> for usize {
     fn from(val: KeyLen) -> Self {
         match val {
             KeyLen::K256 => 32,
-            KeyLen::K196 => 24,
+            KeyLen::K192 => 24,
             KeyLen::K128 => 16,
         }
     }
 }
 
-impl Key {
-    pub fn from_bytes<T: AsRef<[u8]>>(src: T) -> Option<Key> {
-        if let Ok(keylen) = KeyLen::try_from(src.as_ref().len()) {
-            let mut key: MaybeUninit<Key> = MaybeUninit::uninit();
-            let keyptr = key.as_mut_ptr();
-
-            unsafe {
-                let data_ptr = addr_of_mut!((*keyptr).data) as *mut u8;
-                let src_len: usize = keylen.into();
-                data_ptr.copy_from_nonoverlapping(src.as_ref().as_ptr(), src_len);
-                data_ptr.add(src_len).write_bytes(0, 32 - src_len);
-            }
-
-            unsafe {
-                addr_of_mut!((*keyptr).len).write(keylen);
-            };
-
-            Some(unsafe { key.assume_init() })
-        } else {
-            None
-        }
-    }
-
-    pub fn expand(&self) -> ExpandedKey {
-        let mut expkey = match &self.len {
-            KeyLen::K256 => ExpandedKey::K256([0u32; 0x44]),
-            KeyLen::K196 => ExpandedKey::K196([0u32; 0x3c]),
-            KeyLen::K128 => ExpandedKey::K128([0u32; 0x34]),
-        };
-
-        imp::expand_key(expkey.as_mut_slice(), &self.data);
-        expkey
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        self.data.as_byte_slice()
-    }
-}
-
-#[derive(Eq, PartialEq, Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExpandedKey {
     K256([u32; 0x44]),
-    K196([u32; 0x3c]),
+    K192([u32; 0x3c]),
     K128([u32; 0x34]),
 }
 
@@ -211,7 +267,7 @@ impl ExpandedKey {
     fn as_slice(&self) -> &[u32] {
         match self {
             ExpandedKey::K256(s) => s,
-            ExpandedKey::K196(s) => s,
+            ExpandedKey::K192(s) => s,
             ExpandedKey::K128(s) => s,
         }
     }
@@ -219,26 +275,23 @@ impl ExpandedKey {
     fn as_mut_slice(&mut self) -> &mut [u32] {
         match self {
             ExpandedKey::K256(s) => s,
-            ExpandedKey::K196(s) => s,
+            ExpandedKey::K192(s) => s,
             ExpandedKey::K128(s) => s,
         }
     }
 
-    pub fn encrypt_one(&self, data: &Block) -> Block {
-        let data: &[u32; 4] = data.as_rows();
+    pub fn as_bytes(&self) -> &[u8] {
+        slice_u32_to_u8(self.as_slice())
+    }
+
+    pub fn encrypt(&self, data: &Block) -> Block {
         let encrypted = imp::crypt_block(data, self.as_slice());
-        Block(encrypted.as_byte_slice().try_into().unwrap())
+        Block(encrypted)
     }
 
-    pub fn encrypt<const N: usize>(&self, data: &[Block; N]) -> [Block; N] {
-        core::array::from_fn(|i| self.encrypt_one(&data[i]))
-    }
-
-    pub fn encrypt_mut(&self, data: &mut [Block]) {
-        data.iter_mut().for_each(|c| {
-            let tmp = self.encrypt_one(c);
-            c.copy_from_slice(&*tmp)
-        });
+    pub fn encrypt_mut(&self, data: &mut Block) {
+        let encrypted = imp::crypt_block(data, self.as_slice());
+        data.copy_from_slice(&encrypted);
     }
 }
 
@@ -248,22 +301,14 @@ pub struct DecryptKey {
 }
 
 impl DecryptKey {
-    pub fn decrypt_one(&self, data: &Block) -> Block {
-        let data: &[u32] = data.as_slice_of().unwrap();
-        let data: &[u32; 4] = data.try_into().unwrap();
-        let encrypted = imp::crypt_block(data, self.expkey.as_slice());
-        Block(encrypted.as_byte_slice().try_into().unwrap())
+    pub fn decrypt(&self, data: &Block) -> Block {
+        let decrypted = imp::crypt_block(data, self.expkey.as_slice());
+        Block(decrypted)
     }
 
-    pub fn decrypt<const N: usize>(&self, data: &[Block; N]) -> [Block; N] {
-        core::array::from_fn(|i| self.decrypt_one(&data[i]))
-    }
-
-    pub fn decrypt_mut(&self, data: &mut [Block]) {
-        data.iter_mut().for_each(|c| {
-            let tmp = self.decrypt_one(c);
-            c.copy_from_slice(&*tmp)
-        });
+    pub fn decrypt_mut(&self, data: &mut Block) {
+        let newblock = imp::crypt_block(data, self.expkey.as_slice());
+        data.copy_from_slice(&newblock);
     }
 }
 
@@ -282,12 +327,12 @@ mod tests {
 
     #[test]
     fn basic_key_expand() {
-        let key = Key::from_bytes([
+        let key = Key::from([
             0x75, 0x69, 0x49, 0x67, 0x52, 0x55, 0x73, 0x69, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
-        ])
-        .unwrap();
+        ]);
+        assert_eq!(key.len, KeyLen::K256);
 
         let expkey = key.expand();
         let expected = ExpandedKey::K256([
@@ -307,12 +352,12 @@ mod tests {
 
     #[test]
     fn basic_key_expand2() {
-        let key = Key::from_bytes([
+        let key = Key::from([
             0x71, 0x65, 0x46, 0x66, 0x49, 0x79, 0x78, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
-        ])
-        .unwrap();
+        ]);
+        assert_eq!(key.len, KeyLen::K256);
         let expkey = key.expand();
         let deckey: DecryptKey = expkey.into();
 
@@ -333,12 +378,12 @@ mod tests {
 
     #[test]
     fn basic_key_derive() {
-        let key = Key::from_bytes([
+        let key = Key::from([
             0x75, 0x69, 0x49, 0x67, 0x52, 0x55, 0x73, 0x69, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
-        ])
-        .unwrap();
+        ]);
+        assert_eq!(key.len, KeyLen::K256);
 
         let expkey = key.expand();
         let deckey: DecryptKey = expkey.into();
@@ -362,7 +407,7 @@ mod tests {
             0xfa, 0xbd, 0x60, 0xd5, 0x14, 0x19, 0x1e, 0x20, 0xd5, 0x86, 0x52, 0xea, 0xc4, 0xf2, 0xe5, 0x3b,
             0xf8, 0xdf, 0x03, 0x7a, 0x05, 0x5f, 0x94, 0x9e, 0x45, 0xbd, 0x08, 0x86, 0x80, 0x99, 0x7f, 0xe8,
         ];
-        assert_eq!(deckey.expkey.as_slice().as_byte_slice(), &expected_bytes);
+        assert_eq!(deckey.expkey.as_bytes(), &expected_bytes);
     }
 
     fn decode_hex(s: &str) -> Vec<u8> {
@@ -374,14 +419,14 @@ mod tests {
 
     #[test]
     fn encode_decode_u8() {
-        let key = Key::from_bytes([
+        let key = Key::from([
             0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
-        ])
-        .unwrap();
+        ]);
+        assert_eq!(key.len, KeyLen::K256);
 
-        let raw = Block::from_bytes([
+        let raw = Block::from([
             b'e', b'm', b'p', b't', b'y', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00,
         ]);
@@ -391,13 +436,13 @@ mod tests {
         );
 
         let expkey = key.expand();
-        println!("expkey: {:x?}", expkey.as_slice().as_byte_slice());
-        let encoded = expkey.encrypt_one(&raw);
+        println!("expkey: {:x?}", expkey.as_bytes());
+        let encoded = expkey.encrypt(&raw);
         println!("encoded: {:x?}", encoded);
-        assert_eq!(encoded.as_bytes(), &[0x26, 0x86, 0x31, 0xe0, 0xa3, 0x39, 0x88, 0xdc, 0xf7, 0x7f, 0x91, 0xf5, 0x23, 0x57, 0x7f, 0x63]);
+        assert_eq!(*encoded, [0x26, 0x86, 0x31, 0xe0, 0xa3, 0x39, 0x88, 0xdc, 0xf7, 0x7f, 0x91, 0xf5, 0x23, 0x57, 0x7f, 0x63]);
 
         let deckey = DecryptKey::from(expkey);
-        println!("deckey: {:x?}", deckey.expkey.as_slice().as_byte_slice());
+        println!("deckey: {:x?}", deckey.expkey.as_bytes());
         let expected_bytes: [u8; 17*16] = [
             0x72, 0x56, 0x81, 0x98, 0x50, 0x62, 0x4c, 0xe6, 0x60, 0x1b, 0xac, 0x4c, 0x47, 0x6f, 0xc1, 0xa0,
             0x3b, 0x63, 0xf3, 0xa9, 0xd7, 0x53, 0x1a, 0xa5, 0x85, 0x9c, 0xec, 0x0e, 0x6d, 0x98, 0x7f, 0x1d,
@@ -417,13 +462,13 @@ mod tests {
             0xb9, 0x7e, 0x74, 0x17, 0x34, 0xad, 0x2b, 0x89, 0x90, 0x30, 0x9b, 0xad, 0x23, 0x33, 0x77, 0x57,
             0xdc, 0x64, 0xe2, 0xe3, 0xbd, 0xe1, 0x86, 0x7e, 0x0c, 0xb4, 0x1c, 0x4e, 0x6d, 0xb0, 0x32, 0xc5,
         ];
-        assert_eq!(deckey.expkey.as_slice().as_byte_slice(), &expected_bytes);
+        assert_eq!(deckey.expkey.as_bytes(), &expected_bytes);
 
-        let decoded = deckey.decrypt_one(&encoded);
+        let decoded = deckey.decrypt(&encoded);
         println!(
             "decoded: {:x?} ({})",
             decoded,
-            std::str::from_utf8(decoded.as_bytes()).unwrap()
+            std::str::from_utf8(&*decoded).unwrap()
         );
 
         assert_eq!(decoded, raw);
@@ -448,7 +493,7 @@ mod tests {
                 let bytes = decode_hex(value);
                 match id {
                     "KEY" => {
-                        let newkey = Key::from_bytes(bytes).unwrap();
+                        let newkey = Key::try_from(bytes.as_slice()).unwrap();
                         let prev = key.replace(newkey);
                         assert!(prev.is_none());
                     },
@@ -468,14 +513,14 @@ mod tests {
                 let ct = ct.take().unwrap();
                 println!("k={key:x?} pt={pt:x?} ct={ct:x?}");
 
-                let pt_blocks: Vec<Block> = pt.chunks(16).map(Block::from_bytes).collect();
-                let ct_blocks: Vec<Block> = ct.chunks(16).map(Block::from_bytes).collect();
+                let pt_blocks: Vec<Block> = pt.chunks(16).map(Block::from).collect();
+                let ct_blocks: Vec<Block> = ct.chunks(16).map(Block::from).collect();
 
                 let enckey = key.expand();
                 let deckey = DecryptKey::from(enckey.clone());
 
-                let pt_blocks_crypted: Vec<Block> = pt_blocks.iter().map(|b| enckey.encrypt_one(b)).collect();
-                let ct_blocks_decrypted: Vec<Block> = ct_blocks.iter().map(|b| deckey.decrypt_one(b)).collect();
+                let pt_blocks_crypted: Vec<Block> = pt_blocks.iter().map(|b| enckey.encrypt(b)).collect();
+                let ct_blocks_decrypted: Vec<Block> = ct_blocks.iter().map(|b| deckey.decrypt(b)).collect();
 
                 assert_eq!(pt_blocks_crypted, ct_blocks);
                 assert_eq!(ct_blocks_decrypted, pt_blocks);
