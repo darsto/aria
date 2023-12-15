@@ -374,7 +374,8 @@ pub fn crypt_block(data: &[u8; 16], key: &[u32]) -> [u8; 16] {
 
         unsafe {
             ret[i * 4] = roundkey2[3] ^ *IBOX1.get_unchecked(byte3(keyed) as usize) as u8;
-            ret[i * 4 + 1] = roundkey2[2] ^ (*IBOX2.get_unchecked(byte2(keyed) as usize) >> 8) as u8;
+            ret[i * 4 + 1] =
+                roundkey2[2] ^ (*IBOX2.get_unchecked(byte2(keyed) as usize) >> 8) as u8;
             ret[i * 4 + 2] = roundkey2[1] ^ *SBOX1.get_unchecked(byte1(keyed) as usize) as u8;
             ret[i * 4 + 3] = roundkey2[0] ^ *SBOX2.get_unchecked(byte0(keyed) as usize) as u8;
         }
